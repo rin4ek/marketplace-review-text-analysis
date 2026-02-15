@@ -1,0 +1,538 @@
+---
+title: "Language Patterns and Sentiment in Hydra Marketplace Reviews"
+author: "Rina Merkulova"
+date: "2023 (updated 2026)"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Project overview
+
+This project explores a dataset of anonymized user reviews originating from the now-defunct Russian darknet marketplace Hydra, which operated until its closure in 2022. While the platform facilitated illegal transactions, the analytical focus of this project lies **not** in the illicit activity itself, but in the **linguistic and behavioral patterns** reflected in user feedback.
+
+The dataset consists of textual reviews paired with sentiment labels, representing **positive (4–5 stars)** and **negative (1–2 stars)** evaluations. From an analytical perspective, the dataset provides an opportunity to examine how users communicate **satisfaction, dissatisfaction, trust, and expectations** within a highly specialized online environment characterized by **domain-specific vocabulary** and implicit communication norms.
+
+The project serves as an exploration of NLP methods applied to a **non-English corpus** and a **non-standard domain**. The broader motivation stems from an interest in criminology and digital environments, where language plays an important role in signaling trust, risk perception, and shared understanding among users.
+
+#### Research question
+
+**RQ:** *What linguistic patterns and topics emerge in reviews from the Hydra platform, and how do positive and negative sentiments differ in terms of vocabulary, phrasing, and thematic emphasis?*
+
+#### Data source
+
+Kaggle dataset: <https://www.kaggle.com/datasets/kirillkoncha/russian-illegal-drugs-reviews-sentiment-dataset>
+
+#### Disclaimer
+
+This analysis is conducted solely for academic and research purposes. The dataset is used to study language patterns and online communication and **does not endorse or encourage illegal activities**.
+
+##### Project context
+
+This analysis was originally conducted in **2023** as an exam NLP project for a course at **HSE**.  
+In **2026**, the pipeline was partially refactored to improve reproducibility and incorporate modern **tidytext** workflows.
+
+
+```{r, warning=FALSE, message=FALSE}
+library(quanteda)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(readtext)
+library(readr)
+library(tidytext)
+library(wordcloud2)
+library(wordcloud)
+library(tidyr)
+library(forcats)
+library(gridExtra)
+library(grid)
+library(quanteda.textstats)
+library(quanteda.textplots)
+library(lexicon)
+library(topicmodels)
+library(tm)
+library(quanteda)
+library(topicmodels)
+library(stopwords)
+library(glmnet)
+library(Matrix)
+library(magrittr)
+library(tibble)
+
+```
+
+
+```{r Installation}
+data <- read_delim(
+  "data_hydra_new.csv",
+  delim = ";",
+  show_col_types = FALSE
+)
+cat("nrow(data) =", nrow(data), "\n")
+print(names(data))
+str(data)
+```
+
+
+```{r Pre-procession}
+
+# 1) Canonical cleaned dataset 
+data_clean <- data %>%
+  transmute(
+    id = row_number(),
+    content_raw = as.character(content),
+    content = str_squish(as.character(content)),
+    sentiment = as.factor(sentiment)
+  ) %>%
+  filter(!is.na(content), content != "")
+
+custom_sw <- c("это","все","всё","очень","просто","типа","вообще","кстати")
+sw_ru <- tibble(word = unique(c(stopwords::stopwords("ru"), custom_sw)))
+
+# 2) Tidy tokens (for TF–IDF, word counts, jargon words)
+tokens_uni <- data_clean %>%
+  select(id, sentiment, content) %>%
+  unnest_tokens(word, content) %>%
+  mutate(word = str_replace_all(word, "ё", "е")) %>%
+  filter(!str_detect(word, "^[0-9]+$")) %>%
+  anti_join(sw_ru, by = "word")
+
+# 3) Tidy bigrams (for bigram plots, jargon bigrams) 
+tokens_bi <- data_clean %>%
+  select(id, sentiment, content) %>%
+  unnest_tokens(bigram, content, token = "ngrams", n = 2) %>%
+  separate(bigram, into = c("w1","w2"), sep = " ", remove = FALSE) %>%
+  filter(!is.na(w1), !is.na(w2)) %>%
+  mutate(
+    w1 = str_replace_all(w1, "ё", "е"),
+    w2 = str_replace_all(w2, "ё", "е")
+  ) %>%
+  filter(!str_detect(w1, "^[0-9]+$"), !str_detect(w2, "^[0-9]+$")) %>%
+  anti_join(sw_ru, by = c("w1" = "word")) %>%
+  anti_join(sw_ru, by = c("w2" = "word"))
+
+# 4) Quanteda objects (for wordcloud + LDA) 
+# normalization suited for quanteda/topicmodels
+norm_text <- function(x){
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- tolower(x)
+  x <- str_replace_all(x, "ё", "е")
+  x <- str_replace_all(x, "http\\S+|www\\S+", " ")
+  x <- str_replace_all(x, "[^а-яa-z\\s]", " ")
+  x <- str_replace_all(x, "\\s+", " ")
+  str_trim(x)
+}
+
+data_q <- data_clean %>%
+  mutate(text_norm = norm_text(content), doc_id = id) %>%
+  filter(nchar(text_norm) > 0)
+
+corp_q <- quanteda::corpus(data_q, text_field = "text_norm")
+
+toks_q <- quanteda::tokens(
+  corp_q,
+  remove_punct   = TRUE,
+  remove_symbols = TRUE,
+  remove_numbers = TRUE
+)
+
+toks_q <- quanteda::tokens_select(
+  toks_q,
+  pattern   = sw_ru$word,
+  selection = "remove",
+  valuetype = "fixed"
+)
+
+toks_q <- quanteda::tokens_tolower(toks_q)
+
+# Stemming for LDA
+toks_q_lda <- quanteda::tokens_wordstem(toks_q, language = "russian")
+
+dfm_q <- quanteda::dfm(toks_q)
+dfm_q_lda <- quanteda::dfm(toks_q_lda)  
+
+# quick sanity prints
+cat("data_clean:", nrow(data_clean), "docs\n")
+cat("tokens_uni:", nrow(tokens_uni), "rows\n")
+cat("tokens_bi :", nrow(tokens_bi), "rows\n")
+cat("dfm_q vocab:", nfeat(dfm_q), " | dfm_q_lda vocab:", nfeat(dfm_q_lda), "\n")
+
+```
+
+#### Vocabulary overview
+
+To obtain an initial understanding of the dataset vocabulary, a word cloud is used as an exploratory visualization. The goal at this stage is not to distinguish between sentiment classes, but to identify the most frequently occurring terms across the entire corpus.
+
+The visualization shows that the most common words primarily describe operational aspects of the user experience rather than emotional reactions. Many high-frequency terms relate to locations, processes, or transaction outcomes, reflecting the functional nature of reviews in this environment.
+
+Because word frequency highlights globally common terms, this step serves mainly as a general overview of the language used in the dataset. More informative comparisons between positive and negative reviews require methods that emphasize **distinctive** rather than simply frequent words.
+
+
+```{r Word-Cloud, message=FALSE, warning=FALSE}
+
+textplot_wordcloud(dfm_q, min_size = 1, max_size = 5, max_words = 100)
+
+dfm_by_sent <- dfm_group(dfm_q, groups = data_q$sentiment)
+
+textplot_wordcloud(
+  dfm_by_sent,
+  min_size = 0.2, max_size = 10,
+  max_words = 50,
+  comparison = TRUE
+)
+```
+
+The word cloud illustrates that the vocabulary used in the dataset is highly domain-specific. Rather than general emotional expressions, many frequently occurring terms refer to operational aspects of the user experience, such as location descriptions, retrieval processes, and interaction with vendors.
+
+This reflects the functional nature of reviews in this environment: users primarily communicate whether a transaction was successful and whether the process met expectations. As a result, sentiment is often expressed indirectly through descriptions of outcomes rather than explicit emotional language.
+
+An important observation is the presence of specialized jargon. Many commonly used words carry meanings specific to this online context and may not be interpretable without domain knowledge. This highlights a limitation of generic sentiment analysis approaches, as standard sentiment lexicons may fail to capture context-dependent meanings.
+
+#### Distinctive vocabulary: TF–IDF analysis
+
+To identify linguistic differences between positive and negative reviews, TF–IDF weighting is applied. Unlike raw frequency counts, TF–IDF highlights words that are characteristic for a particular group while down-weighting terms that are common across the entire dataset.
+
+This approach makes it possible to identify vocabulary that is specifically associated with positive or negative experiences. The results show that sentiment is often expressed indirectly through descriptions of outcomes and reliability rather than explicit emotional language.
+
+
+
+```{r TF-IDF, message=FALSE, warning=FALSE}
+tfidf <- tokens_uni %>%
+  count(sentiment, word, sort = TRUE) %>%
+  bind_tf_idf(word, sentiment, n) %>%
+  group_by(sentiment) %>%
+  slice_max(tf_idf, n = 20, with_ties = FALSE) %>%
+  ungroup()
+
+ggplot(tfidf, aes(x = tidytext::reorder_within(word, tf_idf, sentiment), y = tf_idf)) +
+  geom_col() +
+  facet_wrap(~ sentiment, scales = "free_y") +
+  tidytext::scale_x_reordered() +
+  coord_flip() +
+  labs(x = NULL, y = "tf-idf", title = "Top characteristic words by sentiment")
+```
+
+#### Distinctive vocabulary by sentiment
+
+The TF–IDF visualization highlights words that are characteristic for positive and negative reviews rather than simply frequent across the entire dataset. Importantly, the distinctive terms do not primarily reflect emotional language but instead describe stages of the interaction process.
+
+Positive reviews tend to contain vocabulary confirming successful completion of expected steps, often signaling that the process unfolded as intended. The language therefore functions as confirmation of reliability with explicit expressions of positive emotion.
+
+In contrast, several words that appear prominently in negative reviews are not inherently negative themselves. Instead, they refer to actions or resolutions attempted after a problem occurred (for example, dispute-related or resolution-related terminology). Their prominence in negative reviews suggests that these terms are used in contexts where an expected outcome failed and corrective actions were initiated but perceived as insufficient.
+
+This indicates that sentiment in this dataset is closely tied to process outcomes. Words gain positive or negative association depending on whether the described interaction successfully resolved the user’s expectations.
+
+
+#### Bigram Analysis
+
+After identifying distinctive vocabulary using TF–IDF, the next step is to examine how words function together in context. While TF–IDF highlights individual terms that are characteristic for positive or negative reviews, it does not capture how meaning emerges through short phrases. 
+
+To address this, bigram analysis is applied to explore the most frequent two-word combinations in the corpus. This allows us to move from isolated words to minimal linguistic context and observe how sentiment is expressed at the phrase level.
+
+This step is particularly important in domain-specific marketplaces where sentiment is often communicated indirectly. Instead of explicit emotional language, users frequently describe actions, outcomes, or recommendations to other users. Examining bigrams helps reveal these patterns by showing how evaluation is embedded in short procedural or advisory expressions.
+
+The analysis is conducted separately for positive and negative sentiment groups in order to compare how phrase-level constructions differ between successful and unsuccessful transaction experiences.
+
+```{r Bigrams, message=FALSE, warning=FALSE}
+top_bigrams <- tokens_bi %>%
+  count(sentiment, bigram, sort = TRUE) %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 20, with_ties = FALSE) %>%
+  ungroup()
+
+ggplot(top_bigrams, aes(x = tidytext::reorder_within(bigram, n, sentiment), y = n)) +
+  geom_col() +
+  facet_wrap(~ sentiment, scales = "free_y") +
+  tidytext::scale_x_reordered() +
+  coord_flip() +
+  labs(x = NULL, y = "count", title = "Top bigrams by sentiment")
+```
+
+#### Interpretation of Bigram Patterns
+
+**Negative reviews** are dominated by *incident-style descriptions* and *conflict-resolution language*. Frequent bigrams refer to failed outcomes and the procedural steps taken afterwards (e.g., disputes, repeated failures, compensation attempts, or references to the shop’s response). This supports the broader observation that negativity is expressed less through emotional vocabulary and more through narratives of what went wrong and what actions followed.
+
+**Positive reviews**, in contrast, resemble *endorsement and loyalty language*. They frequently include:
+- **recommendations to others** (e.g., “всем советую”),
+- **signals of repeated purchase / return intention** (e.g., “ещё забегу”, “повторю”),
+- **confirmation of successful outcomes and quality** (“всё отлично”, “качество хорошее”).
+
+In other words, negative reviews again function as reports of problems and attempted resolution, while positive reviews function as trust reinforcement: they validate the seller/shop and often explicitly indicate willingness to return or recommend the shop to others.
+
+
+#### Topic Modeling (LDA)
+
+In addition to vocabulary exploration and TF–IDF analysis, topic modeling was applied to better understand recurring thematic structures within the review corpus. The objective of this step is interpretive rather than predictive: the goal is not to classify reviews, but to explore how transactional experiences are reflected in language.
+
+The dataset consists of anonymized Russian-language marketplace reviews that are typically short and highly domain-specific. Unlike general consumer reviews, these texts tend to describe actions and outcomes rather than emotions. As a result, topic modeling is used here to identify recurring **process-oriented patterns** in how users describe successful and unsuccessful interactions.
+
+Latent Dirichlet Allocation (LDA) is applied as an exploratory method to detect groups of co-occurring terms that frequently appear together across reviews. Because individual reviews often describe several stages of a transaction (finding a location, retrieving an item, resolving issues, evaluating quality), topics are expected to overlap within documents rather than form strictly separated clusters.
+
+Prior to modeling, the text was normalized, stopwords were removed, and extremely frequent domain-neutral terms were filtered to reduce background noise and allow process-related vocabulary to emerge more clearly.
+
+```{r, LDA}
+
+set.seed(42)
+
+dfm_f <- quanteda::dfm_trim(
+  dfm_q_lda,
+  min_docfreq = 0.007,
+  max_docfreq = 0.35,
+  docfreq_type = "prop"
+)
+
+keep <- quanteda::ntoken(dfm_f) > 0
+dfm_f <- dfm_f[keep, ]
+data_kept <- data_q[keep, , drop = FALSE]
+
+cat("Docs kept:", ndoc(dfm_f), "| Vocab:", nfeat(dfm_f), "\n")
+
+dtm <- quanteda::convert(dfm_f, to = "topicmodels")
+
+K <- 7
+lda_fit <- topicmodels::LDA(
+  dtm, k = K, method = "Gibbs",
+  control = list(seed = 42, burnin = 1000, iter = 2000, thin = 100)
+)
+
+print(lda_fit)
+
+top_terms <- terms(lda_fit, 12)
+print(top_terms)
+
+theta <- posterior(lda_fit)$topics
+theta_df <- as.data.frame(theta)
+
+theta_df$doc_id <- data_kept$doc_id
+theta_df$sentiment <- as.character(data_kept$sentiment)
+
+topic_cols <- setdiff(names(theta_df), c("doc_id", "sentiment"))
+topic_cols <- topic_cols[sapply(theta_df[topic_cols], is.numeric)]
+stopifnot(length(topic_cols) > 0)
+
+topic_means <- theta_df %>%
+  pivot_longer(cols = all_of(topic_cols), names_to = "topic", values_to = "prob") %>%
+  group_by(sentiment, topic) %>%
+  summarise(mean_prob = mean(prob), .groups = "drop") %>%
+  arrange(sentiment, desc(mean_prob))
+
+print(topic_means)
+
+ggplot(topic_means, aes(x = topic, y = mean_prob)) +
+  geom_col() +
+  facet_wrap(~sentiment, ncol = 1) +
+  labs(x = "Topic", y = "Mean topic proportion", title = "Topic prevalence by sentiment")
+
+```
+
+#### Topic Interpretation and Findings
+
+The resulting topics do not primarily reflect emotional categories. Instead, they capture recurring **transactional processes** that structure how reviews are written in this domain.
+
+Several consistent thematic patterns emerge:
+
+- Topics associated with unsuccessful experiences contain vocabulary related to failed retrieval attempts, disputes, compensation, or corrective actions. These reviews describe what went wrong and how the issue was addressed rather than expressing explicit negative emotion.
+- Topics associated with positive sentiment emphasize successful completion, product quality, speed, and reliability, often functioning as confirmation that the expected process worked as intended.
+- Other topics reflect neutral operational stages of the transaction, such as location description, instructions, or interaction flow.
+
+An important observation is that many words appearing in negative reviews are not inherently negative in isolation. Their meaning becomes negative through context, as they appear within narratives describing interruptions or breakdowns in expected processes.
+
+Overall, the topic structure reinforces a central finding of this project: sentiment in this dataset is expressed primarily through **outcomes and procedural narratives**, rather than through emotional language. Reviews function less as opinion statements and more as concise reports of transaction performance. Negative sentiment corresponds to process failure or additional resolution steps, while positive sentiment corresponds to smooth and successful completion of the transaction workflow.
+
+#### Review Length Analysis
+
+In addition to examining vocabulary and phrase-level patterns, it is useful to compare the overall length of positive and negative reviews. Differences in review length can provide additional context for interpreting linguistic patterns observed in previous analyses.
+
+If negative reviews are substantially longer, this may indicate that users engage in more detailed explanations or narratives when reporting problems. Conversely, shorter positive reviews may reflect more formulaic expressions of satisfaction or confirmation of successful outcomes. Examining review length therefore helps distinguish whether observed differences in language are driven by verbosity and emotional elaboration, or by differences in the type of information being communicated.
+
+To assess this, the average and median number of words per review are calculated separately for positive and negative sentiment groups.
+
+```{r Length-Words, message=FALSE, warning=FALSE}
+
+length_df <- data_clean %>%
+  mutate(
+    n_words = str_count(content, "\\S+")
+  ) %>%
+  group_by(sentiment) %>%
+  summarise(
+    n_docs = n(),
+    mean_words = mean(n_words),
+    median_words = median(n_words),
+    .groups = "drop"
+  )
+
+print(length_df)
+```
+
+#### Review Length Comparison
+
+The comparison of review length shows only a modest difference between negative and positive reviews. Negative reviews contain, on average, slightly more words (mean ≈ 27 words, median = 20) than positive reviews (mean ≈ 25 words, median = 15). 
+
+This difference is consistent with patterns observed in the previous analyses. Negative reviews tend to include additional procedural detail, often describing what went wrong and the subsequent steps taken to resolve the issue (e.g., failed retrieval attempts, disputes, or communication with the seller). As a result, they are slightly longer and more descriptive.
+
+Positive reviews, in contrast, are typically shorter and more formulaic. They frequently function as confirmations of successful completion or expressions of gratitude and recommendation, which require less narrative detail. This aligns with the bigram analysis, where positive sentiment is commonly expressed through short endorsement phrases rather than extended descriptions.
+
+Importantly, the overall difference in length remains relatively small. This suggests that sentiment differences in the dataset are not primarily driven by verbosity or emotional elaboration, but rather by the type of information conveyed. Reviews in both categories remain concise and process-oriented, reinforcing the interpretation of marketplace feedback as transactional reporting rather than expressive opinion writing.
+
+#### Domain-Specific Vocabulary and Slang
+
+The dataset originates from a highly domain-specific environment where communication practices differ from conventional online marketplaces. In such contexts, users often develop shared vocabulary, shorthand expressions, or recurring phrases that carry meaning specific to the community and may not appear in general-language corpora. As a result, standard frequency-based methods may overlook terms that are important within the domain but relatively rare outside it.
+
+To account for this, an additional analysis focuses on identifying domain-specific or “jargon-like” expressions. The goal is not linguistic classification in a strict sense, but exploratory identification of words and phrases that are disproportionately associated with either positive or negative experiences and that may reflect shared conventions of communication within the marketplace.
+
+This analysis is conducted in two steps:
+
+1. **Distinctive word analysis**, where words are compared between positive and negative reviews using smoothed log-odds ratios. This allows identification of terms that are statistically overrepresented in one sentiment group relative to the other, highlighting vocabulary that functions as domain-specific evaluative language.
+
+2. **Bigram association analysis**, where pairs of words are evaluated using pointwise mutual information (PMI). Unlike simple frequency counts, PMI highlights word combinations that occur together more often than expected by chance, helping to identify fixed expressions, recurring phrases, or community-specific shorthand that may function as informal jargon.
+
+Together, these approaches allow the analysis to move beyond general sentiment indicators and capture linguistic patterns shaped by the specific social and transactional environment in which the reviews were produced.
+
+
+```{r Jargon-Words, message=FALSE, warning=FALSE}
+
+set.seed(123)
+
+MIN_WORD_FREQ <- 10
+ALPHA <- 0.5
+
+tok_y <- tokens_uni %>%
+  mutate(y = ifelse(as.character(sentiment) == "1", 1, 0))
+
+counts <- tok_y %>%
+  count(y, word, sort = TRUE)
+
+totals <- counts %>%
+  group_by(y) %>%
+  summarise(total = sum(n), .groups = "drop")
+
+wide <- counts %>%
+  select(y, word, n) %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0)
+
+total0 <- totals$total[totals$y == 0]
+total1 <- totals$total[totals$y == 1]
+
+word_logodds <- wide %>%
+  mutate(
+    freq = `0` + `1`,
+    p0 = (`0` + ALPHA) / (total0 + 2*ALPHA),
+    p1 = (`1` + ALPHA) / (total1 + 2*ALPHA),
+    log_odds = log(p1/(1-p1)) - log(p0/(1-p0))
+  ) %>%
+  filter(freq >= MIN_WORD_FREQ) %>%
+  arrange(desc(log_odds))
+
+jargon_pos_words <- word_logodds %>% slice_max(log_odds, n = 25, with_ties = FALSE) %>%
+  transmute(word, log_odds, pos_n = `1`, neg_n = `0`, freq)
+
+jargon_neg_words <- word_logodds %>% slice_min(log_odds, n = 25, with_ties = FALSE) %>%
+  transmute(word, log_odds, pos_n = `1`, neg_n = `0`, freq)
+
+plot_words <- bind_rows(
+  jargon_pos_words %>% mutate(class = "POS"),
+  jargon_neg_words %>% mutate(class = "NEG")
+)
+
+ggplot(plot_words, aes(x = reorder(word, log_odds), y = log_odds)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ class, scales = "free_y") +
+  labs(title = "Distinctive words by class (log-odds)", x = NULL, y = "log-odds (POS vs NEG)")
+
+
+```
+
+#### Interpretation of Distinctive Vocabulary
+
+The log-odds analysis highlights vocabulary that is disproportionately associated with either positive or negative reviews, allowing identification of domain-specific evaluative language rather than simply frequent words.
+
+The results show a clear functional distinction between the two sentiment groups.
+
+Words associated with **negative reviews** are primarily linked to problem reporting and conflict resolution. Many of the distinctive terms refer to unsuccessful outcomes, repeated attempts, disputes, or interactions with the seller following a problem. (Mostly) rather than expressing strong emotional negativity, these words appear in procedural descriptions of what went wrong and how the situation was handled. This reinforces earlier findings that negative sentiment in this dataset is communicated through process narratives rather than emotional expression.
+
+In contrast, **positive reviews** are characterized by evaluative and endorsement-oriented language. Distinctive words emphasize quality confirmation, satisfaction, and approval, often functioning as signals of trust or recommendation. Expressions commonly associated with positive sentiment resemble short approval formulas or praise, reinforcing the reliability of the seller or product.
+
+Overall, the vocabulary patterns suggest that language in this environment serves a practical communicative function: negative reviews document failures and resolution attempts, while positive reviews reinforce trust and signal successful transactions.
+
+
+```{r Jargon-Bigrams, message=FALSE, warning=FALSE}
+
+set.seed(123)
+
+MIN_BIGRAM_N <- 5
+ALPHA <- 0.5
+
+bi_y <- tokens_bi %>%
+  mutate(y = ifelse(as.character(sentiment) == "1", 1, 0))
+
+bigram_counts <- bi_y %>%
+  count(y, w1, w2, sort = TRUE)
+
+word_counts <- tokens_uni %>%
+  mutate(y = ifelse(as.character(sentiment) == "1", 1, 0)) %>%
+  count(y, word, sort = TRUE)
+
+totals <- word_counts %>%
+  group_by(y) %>%
+  summarise(total = sum(n), .groups = "drop")
+
+pmi <- bigram_counts %>%
+  left_join(word_counts %>% rename(w1 = word, n_w1 = n), by = c("y","w1")) %>%
+  left_join(word_counts %>% rename(w2 = word, n_w2 = n), by = c("y","w2")) %>%
+  group_by(y) %>%
+  mutate(bigram_total = sum(n)) %>%
+  ungroup() %>%
+  left_join(totals, by = "y") %>%
+  mutate(
+    p_w1   = (n_w1 + ALPHA) / (total + 2*ALPHA),
+    p_w2   = (n_w2 + ALPHA) / (total + 2*ALPHA),
+    p_w1w2 = (n + ALPHA) / (bigram_total + 2*ALPHA),
+    PMI = log2(p_w1w2 / (p_w1 * p_w2)),
+    phrase = paste(w1, w2)
+  ) %>%
+  filter(n >= MIN_BIGRAM_N) %>%
+  arrange(desc(PMI))
+
+top_pmi <- pmi %>%
+  group_by(y) %>%
+  slice_max(PMI, n = 20, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(class = ifelse(y == 1, "POS", "NEG"))
+
+ggplot(top_pmi, aes(x = tidytext::reorder_within(phrase, PMI, class), y = PMI)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ class, scales = "free_y") +
+  tidytext::scale_x_reordered() +
+  labs(title = "High-PMI bigrams (fixed expressions / slang candidates)", x = NULL, y = "PMI")
+
+```
+
+#### Interpretation of High-PMI Bigrams
+
+The PMI-based bigram analysis further reveals recurring phrase structures that function as fixed expressions within the community. Unlike frequency-based bigrams, PMI highlights word combinations that occur together more often than expected by chance, making it particularly useful for identifying informal jargon or conventionalized phrases.
+
+Negative high-PMI bigrams predominantly reflect problem-oriented communication. Many phrases describe unsuccessful outcomes, repeated failures, or actions taken to resolve disputes. These expressions often resemble short incident summaries or advice implicitly directed at other users, reinforcing the role of negative reviews as informational warnings rather than emotional reactions.
+
+Positive high-PMI bigrams, by contrast, form recognizable endorsement patterns. Common phrases express satisfaction, appreciation, or willingness to continue interaction with the seller. Many of these combinations function as trust-reinforcing formulas, signaling successful completion and future intention to return or recommend the shop.
+
+Taken together, these results indicate that domain-specific language emerges as an adaptation to the transactional environment itself. Rather than emphasizing emotional expression, users rely on shared shorthand expressions that efficiently communicate reliability, risk, and transaction outcomes to other participants.
+
+
+### Overall Interpretation
+
+Across all stages of the analysis — vocabulary exploration, TF–IDF comparison, bigram analysis, topic modeling, and domain-specific vocabulary identification — a consistent pattern emerges. Sentiment in this dataset is not primarily expressed through emotional or affective language. Instead, reviews function as concise reports of transactional experience.
+
+Negative reviews tend to describe interruptions in expected processes, such as unsuccessful retrieval attempts, disputes, or corrective actions, and therefore contain more procedural and explanatory language. Positive reviews, in contrast, emphasize successful completion, quality confirmation, and endorsement, often taking the form of short trust-reinforcing expressions or recommendations to other users.
+
+The convergence of results across multiple analytical methods suggests that language in this environment is shaped by the practical needs of the marketplace itself. Communication prioritizes efficiency and shared understanding over emotional expression, resulting in a form of domain-specific discourse where sentiment is encoded through outcomes, processes, and community-oriented signaling rather than explicit evaluation.
+
+Taken together, the findings highlight how linguistic patterns adapt to the social and transactional context in which they emerge, demonstrating the importance of interpreting sentiment within its domain-specific communicative environment rather than relying solely on general-purpose sentiment assumptions.
+
