@@ -34,3 +34,4 @@ Overall, the project demonstrates how NLP methods can be used to understand comm
 ## Output
 
 The full analysis is available in the HTML report included in this repository.
+**[Open full analysis report](https://rin4ek.github.io/marketplace-review-text-analysis/)**
